@@ -1,0 +1,24 @@
+{
+  "profiles": [
+    {
+      "name": "ios_safari_17",
+      "cipher_suites": [4865, 4866, 4867, 49196, 49195, 52393, 49200, 49199, 52392, 49188, 49187, 49192, 49191, 49162, 49161, 49172, 49171, 157, 156, 61, 60, 53, 47, 255],
+      "extensions": [0, 23, 65281, 10, 11, 35, 16, 5, 34, 51, 43, 13, 45, 28, 21],
+      "supported_versions": [772, 771],
+      "alpn": ["h2", "http/1.1"],
+      "grease": [2570, 6682, 10794],
+      "http2_settings": {
+        "header_table_size": 65536,
+        "enable_push": 0,
+        "max_concurrent_streams": 0,
+        "initial_window_size": 1048576,
+        "max_frame_size": 16384,
+        "max_header_list_size": 0,
+        "window_update": 15663105
+      },
+      "signature_algorithms": [1027, 2052, 1283, 2053, 1539, 2054, 2055, 2056, 2057, 2058, 2059, 2060, 1025, 1281, 1537, 771, 769, 770],
+      "supported_groups": [29, 23, 30, 25, 24]
+    }
+  ],
+  "default_profile": "ios_safari_17"
+}
