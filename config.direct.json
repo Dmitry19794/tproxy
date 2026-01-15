@@ -1,0 +1,23 @@
+{
+  "profiles": [
+    {
+      "name": "ios_safari",
+      "cipher_suites": [],
+      "extensions": [],
+      "supported_versions": [],
+      "alpn": [],
+      "signature_algorithms": [],
+      "key_share_groups": [],
+      "psk_key_exchange_modes": [],
+      "compress_certificate": []
+    }
+  ],
+  "default_profile": "ios_safari",
+  "proxy_settings": {
+    "proxy_host": "",
+    "proxy_port": 0,
+    "proxy_type": "direct",
+    "username": null,
+    "password": null
+  }
+}

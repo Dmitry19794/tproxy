@@ -1,74 +1,86 @@
-// src/main.rs
-#![allow(dead_code, unused_imports)]
-
-#[cfg(all(unix, not(target_env = "musl")))]
-#[global_allocator]
-static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-use anyhow::Result;
-use tracing::info;
+use tokio::net::TcpListener;
 use std::sync::Arc;
+use anyhow::Result;
 
 mod config;
-mod tcp;
-mod tls;
-mod http2;
-mod udp;
 mod proxy;
-mod challenge;
+mod tls;
+mod tcp;
+mod udp;
+mod http2;
 mod packet;
-mod nfqueue_handler;
 mod state;
+mod challenge;
 mod timing;
+mod nfqueue_handler;
+mod zerocopy;
+mod graceful;
+mod http2_advanced;
+mod tcp_advanced;
 
 use config::Config;
-use nfqueue_handler::{NfqueueHandler, cleanup_iptables};
+use proxy::ProxyHandler;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    env_logger::init();
 
-    info!("🚀 TPROXY Production v2.0 - Full Mode");
-
-    // Load config
-    let config = match Config::load("config.json") {
-        Ok(cfg) => {
-            info!("✓ Config loaded: {} profiles", cfg.profiles.len());
-            Arc::new(cfg)
-        }
-        Err(_) => {
-            info!("Using default config");
-            Arc::new(Config::default())
-        }
+    // Поддержка выбора конфига через аргумент
+    let args: Vec<String> = std::env::args().collect();
+    let config_path = if args.len() > 1 {
+        &args[1]
+    } else {
+        "config.json"
     };
 
-    let profile = config.default_profile();
-    info!("Profile: {}", profile.name);
-    info!("Cipher suites: {}", profile.cipher_suites.len());
-    info!("Extensions: {}", profile.extensions.len());
-
-    // Cleanup on exit
-    ctrlc::set_handler(move || {
-        info!("Cleaning up...");
-        let _ = cleanup_iptables();
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
-
-    // Start NFQUEUE handler
-    info!("Starting NFQUEUE packet processing...");
-    let mut handler = NfqueueHandler::new(0, config.clone())?;
+    let config = Config::load(config_path).unwrap_or_else(|e| {
+        log::warn!("Failed to load {}: {}, using defaults", config_path, e);
+        Config::default()
+    });
     
-    info!("✅ System ready - intercepting HTTPS traffic");
-    info!("Press Ctrl+C to stop");
+    log::info!("Configuration loaded from: {}", config_path);
+    log::info!("Default profile: {}", config.default_profile);
     
-    // Run packet processing (blocking)
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = handler.run() {
-            tracing::error!("NFQUEUE handler error: {}", e);
+    if config.proxy_settings.is_direct() {
+        log::info!("Proxy: DIRECT MODE (no upstream proxy)");
+    } else {
+        log::info!("Proxy: {}:{} ({})", 
+            config.proxy_settings.proxy_host,
+            config.proxy_settings.proxy_port,
+            config.proxy_settings.proxy_type
+        );
+    }
+
+    let proxy_handler = Arc::new(ProxyHandler::new(config));
+
+    // Запускаем задачу очистки
+    let cleanup_handler = proxy_handler.clone();
+    tokio::spawn(async move {
+        cleanup_handler.cleanup_task().await;
+    });
+
+    let listen_addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(listen_addr).await?;
+    log::info!("TPROXY listening on {}", listen_addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                log::debug!("New connection from {}", addr);
+                
+                let handler = proxy_handler.clone();
+                
+                tokio::spawn(async move {
+                    if let Err(e) = handler.handle_connection(stream).await {
+                        log::error!("Connection error from {}: {}", addr, e);
+                    } else {
+                        log::debug!("Connection from {} closed successfully", addr);
+                    }
+                });
+            }
+            Err(e) => {
+                log::error!("Accept error: {}", e);
+            }
         }
-    }).await?;
-
-    Ok(())
+    }
 }

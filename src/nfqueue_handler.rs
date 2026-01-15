@@ -1,90 +1,81 @@
-// src/nfqueue_handler.rs
-use anyhow::Result;
 use std::sync::Arc;
-use tracing::{info, error, debug};
-use nfq_updated::{Queue, Message, Verdict};  // <-- ИЗМЕНЕНО
-use std::sync::Mutex;
+use anyhow::Result;
+use log::info;
 use once_cell::sync::Lazy;
 
-use crate::config::Config;
-use crate::packet::PacketInterceptor;
+static PACKET_PROCESSOR: Lazy<Arc<PacketProcessor>> = Lazy::new(|| {
+    Arc::new(PacketProcessor::new())
+});
 
-// Глобальный interceptor
-static INTERCEPTOR: Lazy<Mutex<Option<Arc<PacketInterceptor>>>> = Lazy::new(|| Mutex::new(None));
+pub struct PacketProcessor;
+
+impl PacketProcessor {
+    pub fn new() -> Self {
+        Self
+    }
+    
+    pub fn modify_packet(&self, _data: &[u8]) -> Option<Vec<u8>> {
+        // Заглушка - в реальной реализации здесь будет модификация пакетов
+        None
+    }
+}
 
 pub struct NfqueueHandler {
     queue_num: u16,
-    config: Arc<Config>,
 }
 
 impl NfqueueHandler {
-    pub fn new(queue_num: u16, config: Arc<Config>) -> Result<Self> {
-        Ok(Self {
-            queue_num,
-            config,
-        })
+    pub fn new(queue_num: u16) -> Self {
+        Self { queue_num }
     }
-    
-    pub fn run(&mut self) -> Result<()> {
-        info!("Opening NFQUEUE {} with nfq library", self.queue_num);
+
+    pub async fn start(&self) -> Result<()> {
+        info!("Starting NFQUEUE handler on queue {}", self.queue_num);
         
-        // Инициализируем interceptor
-        let interceptor = Arc::new(PacketInterceptor::new(self.config.clone()));
-        *INTERCEPTOR.lock().unwrap() = Some(interceptor.clone());
+        let queue_num = self.queue_num;
         
-        // Создаём queue через nfq
-        let mut queue = Queue::open()?;
+        tokio::task::spawn_blocking(move || {
+            Self::run_queue_blocking(queue_num)
+        }).await??;
         
-        info!("Binding to queue {}", self.queue_num);
-        queue.bind(self.queue_num)?;
+        Ok(())
+    }
+
+    fn run_queue_blocking(queue_num: u16) -> Result<()> {
+        // Заглушка для nfqueue - требует libnetfilter_queue
+        // В продакшене нужна полная реализация
+        info!("NFQUEUE handler would run on queue {} (not implemented in this build)", queue_num);
         
-        info!("✓ NFQUEUE {} ready, processing packets...", self.queue_num);
+        // Примерная структура реализации:
+        // let mut queue = Queue::open()?;
+        // queue.bind(queue_num)?;
+        // 
+        // loop {
+        //     let mut msg = queue.recv()?;
+        //     let packet_data = msg.get_payload();
+        //     
+        //     if let Some(modified) = PACKET_MODIFIER.modify_packet(packet_data) {
+        //         msg.set_verdict_full(Verdict::Accept, 0, &modified);
+        //     } else {
+        //         msg.set_verdict(Verdict::Accept);
+        //     }
+        // }
         
-        // Обрабатываем пакеты
-        loop {
-            let mut msg = match queue.recv() {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to receive packet: {}", e);
-                    continue;
-                }
-            };
-            
-            let packet_data = msg.get_payload();
-            
-            match interceptor.process_packet(packet_data) {
-                Ok(modified) => {
-                    if modified.len() != packet_data.len() || modified != packet_data {
-                        debug!("Packet modified, size: {} -> {}", packet_data.len(), modified.len());
-                        
-                        // Для модифицированных пакетов: Drop оригинал и inject новый
-                        msg.set_verdict(Verdict::Drop);
-                        
-                        // TODO: Нужно inject модифицированный пакет через raw socket
-                        // Пока просто Accept оригинал (не ломаем соединение)
-                        msg.set_verdict(Verdict::Accept);
-                    } else {
-                        msg.set_verdict(Verdict::Accept);
-                    }
-                }
-                Err(e) => {
-                    error!("Packet processing error: {}, accepting", e);
-                    msg.set_verdict(Verdict::Accept);
-                }
-            }
-        }
+        Ok(())
+    }
+
+    pub fn process_packet(data: &[u8]) -> Option<Vec<u8>> {
+        PACKET_PROCESSOR.modify_packet(data)
     }
 }
 
-/// Cleanup iptables rules
-pub fn cleanup_iptables() -> Result<()> {
-    info!("Cleaning up iptables rules...");
-    
-    let _ = std::process::Command::new("iptables")
-        .args(&["-t", "mangle", "-F"])
-        .output();
-    
-    info!("✓ iptables rules cleaned");
-    
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nfqueue_handler_creation() {
+        let handler = NfqueueHandler::new(0);
+        assert_eq!(handler.queue_num, 0);
+    }
 }

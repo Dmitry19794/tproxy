@@ -1,291 +1,326 @@
-// src/state.rs - State Management для cookies и sessions
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
+use cookie::Cookie;
 
-/// Cookie store для сохранения между запросами
 #[derive(Debug, Clone)]
-pub struct Cookie {
-    pub name: String,
-    pub value: String,
-    pub domain: Option<String>,
-    pub path: Option<String>,
-    pub expires: Option<u64>,
-    pub http_only: bool,
-    pub secure: bool,
-    pub same_site: Option<String>,
-    pub created_at: Instant,
+pub struct TcpState {
+    pub seq: u32,
+    pub ack: u32,
+    pub window: u16,
+    pub timestamp: u64,
 }
 
-impl Cookie {
-    pub fn is_expired(&self) -> bool {
-        if let Some(expires) = self.expires {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            now > expires
-        } else {
-            false
+impl TcpState {
+    pub fn new(seq: u32, ack: u32, window: u16) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Self {
+            seq,
+            ack,
+            window,
+            timestamp,
         }
     }
-    
-    pub fn matches_domain(&self, domain: &str) -> bool {
-        if let Some(cookie_domain) = &self.domain {
-            domain.ends_with(cookie_domain) || domain == cookie_domain
-        } else {
-            true
-        }
-    }
-    
-    pub fn matches_path(&self, path: &str) -> bool {
-        if let Some(cookie_path) = &self.path {
-            path.starts_with(cookie_path)
-        } else {
-            true
-        }
+
+    pub fn update(&mut self, seq: u32, ack: u32, window: u16) {
+        self.seq = seq;
+        self.ack = ack;
+        self.window = window;
+        self.timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
     }
 }
 
-/// Cookie Store с автоматической очисткой expired
-pub struct CookieStore {
-    cookies: Arc<RwLock<HashMap<String, Vec<Cookie>>>>,
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    pub session_id: String,
+    pub cookies: HashMap<String, Vec<String>>,
+    pub created_at: u64,
+    pub last_used: u64,
 }
 
-impl CookieStore {
+impl SessionState {
+    pub fn new(session_id: String) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Self {
+            session_id,
+            cookies: HashMap::new(),
+            created_at: now,
+            last_used: now,
+        }
+    }
+
+    pub fn add_cookie(&mut self, domain: String, cookie: String) {
+        self.cookies.entry(domain).or_insert_with(Vec::new).push(cookie);
+        self.update_last_used();
+    }
+
+    pub fn get_cookies(&self, domain: &str) -> Vec<String> {
+        self.cookies.get(domain).cloned().unwrap_or_default()
+    }
+
+    pub fn update_last_used(&mut self) {
+        self.last_used = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+    }
+
+    pub fn is_expired(&self, max_age: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        now - self.last_used > max_age
+    }
+}
+
+pub struct StateManager {
+    tcp_states: Arc<RwLock<HashMap<String, TcpState>>>,
+    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    cookies: Arc<RwLock<HashMap<String, Vec<String>>>>,
+}
+
+impl StateManager {
     pub fn new() -> Self {
         Self {
+            tcp_states: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             cookies: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-    
-    /// Добавить cookie
-    pub fn add(&self, domain: &str, cookie: Cookie) {
-        let mut cookies = self.cookies.write();
-        let entry = cookies.entry(domain.to_string()).or_insert_with(Vec::new);
-        
-        // Удаляем старый cookie с тем же именем
-        entry.retain(|c| c.name != cookie.name);
-        
-        // Добавляем новый
-        entry.push(cookie);
+
+    pub fn store_tcp_state(&self, conn_id: String, state: TcpState) {
+        self.tcp_states.write().insert(conn_id, state);
     }
-    
-    /// Получить cookies для домена и пути
-    pub fn get(&self, domain: &str, path: &str) -> Vec<Cookie> {
+
+    pub fn get_tcp_state(&self, conn_id: &str) -> Option<TcpState> {
+        self.tcp_states.read().get(conn_id).cloned()
+    }
+
+    pub fn update_tcp_state(&self, conn_id: &str, seq: u32, ack: u32, window: u16) {
+        if let Some(state) = self.tcp_states.write().get_mut(conn_id) {
+            state.update(seq, ack, window);
+        }
+    }
+
+    pub fn create_session(&self, session_id: String) -> SessionState {
+        let session = SessionState::new(session_id.clone());
+        self.sessions.write().insert(session_id, session.clone());
+        session
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Option<SessionState> {
+        let mut sessions = self.sessions.write();
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.update_last_used();
+            return Some(session.clone());
+        }
+        None
+    }
+
+    pub fn add_session_cookie(&self, session_id: &str, domain: String, cookie: String) {
+        if let Some(session) = self.sessions.write().get_mut(session_id) {
+            session.add_cookie(domain, cookie);
+        }
+    }
+
+    pub fn store_cookie(&self, domain: String, cookie: String) {
+        self.cookies.write()
+            .entry(domain)
+            .or_insert_with(Vec::new)
+            .push(cookie);
+    }
+
+    pub fn get_cookies(&self, domain: &str) -> Vec<String> {
         let cookies = self.cookies.read();
         
-        let mut result = Vec::new();
-        
-        // Проверяем все домены (включая родительские)
-        for (stored_domain, domain_cookies) in cookies.iter() {
-            if domain.ends_with(stored_domain) {
-                for cookie in domain_cookies {
-                    if !cookie.is_expired() 
-                        && cookie.matches_domain(domain)
-                        && cookie.matches_path(path) {
-                        result.push(cookie.clone());
-                    }
-                }
-            }
+        if let Some(domain_cookies) = cookies.get(domain) {
+            domain_cookies.iter()
+                .filter_map(|cookie_str| {
+                    Cookie::parse(cookie_str).ok().and_then(|cookie| {
+                        if !cookie.name().is_empty() {
+                            Some(cookie_str.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
         }
-        
-        result
     }
-    
-    /// Очистить expired cookies
-    pub fn cleanup_expired(&self) {
+
+    pub fn cleanup(&self) {
         let mut cookies = self.cookies.write();
         
         for domain_cookies in cookies.values_mut() {
-            domain_cookies.retain(|c| !c.is_expired());
+            domain_cookies.retain(|cookie_str| {
+                if let Ok(cookie) = Cookie::parse(cookie_str) {
+                    !cookie.name().is_empty()
+                } else {
+                    false
+                }
+            });
         }
-        
-        // Удаляем пустые домены
+
         cookies.retain(|_, v| !v.is_empty());
-    }
-    
-    /// Получить все cookies (для отладки)
-    pub fn get_all(&self) -> HashMap<String, Vec<Cookie>> {
-        self.cookies.read().clone()
-    }
-    
-    /// Очистить все cookies
-    pub fn clear(&self) {
-        self.cookies.write().clear();
+
+        let mut sessions = self.sessions.write();
+        sessions.retain(|_, session| !session.is_expired(3600));
+
+        log::debug!("Cleaned up expired cookies and sessions");
     }
 }
 
-/// Session Store для сохранения состояния между запросами
+pub struct ConnectionStateManager {
+    connections: Arc<RwLock<HashMap<u64, ConnectionInfo>>>,
+    next_id: Arc<RwLock<u64>>,
+}
+
 #[derive(Debug, Clone)]
-pub struct Session {
-    pub id: String,
-    pub data: HashMap<String, String>,
-    pub created_at: Instant,
-    pub last_accessed: Instant,
+pub struct ConnectionInfo {
+    pub id: u64,
+    pub created_at: u64,
+    pub last_activity: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
-pub struct SessionStore {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
-    timeout: Duration,
-}
+impl ConnectionInfo {
+    pub fn new(id: u64) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-impl SessionStore {
-    pub fn new(timeout_secs: u64) -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            timeout: Duration::from_secs(timeout_secs),
+            id,
+            created_at: now,
+            last_activity: now,
+            bytes_sent: 0,
+            bytes_received: 0,
         }
     }
-    
-    /// Создать новую сессию
-    pub fn create(&self, id: String) -> Session {
-        let session = Session {
-            id: id.clone(),
-            data: HashMap::new(),
-            created_at: Instant::now(),
-            last_accessed: Instant::now(),
-        };
-        
-        self.sessions.write().insert(id, session.clone());
-        session
-    }
-    
-    /// Получить сессию
-    pub fn get(&self, id: &str) -> Option<Session> {
-        let mut sessions = self.sessions.write();
-        
-        if let Some(session) = sessions.get_mut(id) {
-            // Проверяем timeout
-            if session.last_accessed.elapsed() > self.timeout {
-                sessions.remove(id);
-                return None;
-            }
-            
-            // Обновляем last_accessed
-            session.last_accessed = Instant::now();
-            Some(session.clone())
-        } else {
-            None
-        }
-    }
-    
-    /// Обновить данные сессии
-    pub fn update(&self, id: &str, key: String, value: String) {
-        let mut sessions = self.sessions.write();
-        
-        if let Some(session) = sessions.get_mut(id) {
-            session.data.insert(key, value);
-            session.last_accessed = Instant::now();
-        }
-    }
-    
-    /// Удалить сессию
-    pub fn remove(&self, id: &str) {
-        self.sessions.write().remove(id);
-    }
-    
-    /// Очистить expired сессии
-    pub fn cleanup_expired(&self) {
-        let mut sessions = self.sessions.write();
-        sessions.retain(|_, session| session.last_accessed.elapsed() <= self.timeout);
+
+    pub fn update_activity(&mut self) {
+        self.last_activity = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
     }
 }
 
-/// Challenge cookies manager (интеграция с CookieStore)
-pub struct ChallengeCookieManager {
-    cookie_store: CookieStore,
-}
-
-impl ChallengeCookieManager {
+impl ConnectionStateManager {
     pub fn new() -> Self {
         Self {
-            cookie_store: CookieStore::new(),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            next_id: Arc::new(RwLock::new(1)),
         }
     }
-    
-    /// Сохранить challenge cookie
-    pub fn store_challenge_cookie(&self, domain: &str, name: &str, value: &str) {
-        let cookie = Cookie {
-            name: name.to_string(),
-            value: value.to_string(),
-            domain: Some(domain.to_string()),
-            path: Some("/".to_string()),
-            expires: None, // Session cookie
-            http_only: true,
-            secure: true,
-            same_site: Some("None".to_string()),
-            created_at: Instant::now(),
-        };
-        
-        self.cookie_store.add(domain, cookie);
-    }
-    
-    /// Получить challenge cookies для домена
-    pub fn get_challenge_cookies(&self, domain: &str) -> Vec<Cookie> {
-        self.cookie_store.get(domain, "/")
-            .into_iter()
-            .filter(|c| {
-                c.name.starts_with("__cf") || 
-                c.name.starts_with("cf_") ||
-                c.name.starts_with("_px")
-            })
-            .collect()
-    }
-    
-    /// Форматировать cookies в Cookie header
-    pub fn format_cookie_header(&self, domain: &str) -> String {
-        let cookies = self.get_challenge_cookies(domain);
-        
-        cookies.iter()
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-}
 
-// Periodic cleanup task
-pub async fn cleanup_task(
-    cookie_store: Arc<CookieStore>,
-    session_store: Arc<SessionStore>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 минут
-    
-    loop {
-        interval.tick().await;
-        
-        cookie_store.cleanup_expired();
-        session_store.cleanup_expired();
-        
-        tracing::debug!("Cleaned up expired cookies and sessions");
+    pub fn create_connection(&self) -> u64 {
+        let mut next_id = self.next_id.write();
+        let id = *next_id;
+        *next_id += 1;
+
+        let info = ConnectionInfo::new(id);
+        self.connections.write().insert(id, info);
+
+        id
+    }
+
+    pub fn remove_connection(&self, id: u64) {
+        self.connections.write().remove(&id);
+    }
+
+    pub fn update_activity(&self, id: u64) {
+        if let Some(info) = self.connections.write().get_mut(&id) {
+            info.update_activity();
+        }
+    }
+
+    pub fn get_connection(&self, id: u64) -> Option<ConnectionInfo> {
+        self.connections.read().get(&id).cloned()
+    }
+
+    pub fn get_active_count(&self) -> usize {
+        self.connections.read().len()
+    }
+
+    pub fn cleanup(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.connections.write().retain(|_, info| {
+            now - info.last_activity < 300
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_cookie_store() {
-        let store = CookieStore::new();
+    fn test_tcp_state() {
+        let mut state = TcpState::new(1000, 2000, 65535);
+        assert_eq!(state.seq, 1000);
+        assert_eq!(state.ack, 2000);
+
+        state.update(1100, 2100, 65535);
+        assert_eq!(state.seq, 1100);
+        assert_eq!(state.ack, 2100);
+    }
+
+    #[test]
+    fn test_session_state() {
+        let mut session = SessionState::new("session123".to_string());
         
-        let cookie = Cookie {
-            name: "test".to_string(),
-            value: "value".to_string(),
-            domain: Some("example.com".to_string()),
-            path: Some("/".to_string()),
-            expires: None,
-            http_only: false,
-            secure: false,
-            same_site: None,
-            created_at: Instant::now(),
-        };
+        session.add_cookie("example.com".to_string(), "cookie1=value1".to_string());
         
-        store.add("example.com", cookie);
-        
-        let cookies = store.get("example.com", "/");
+        let cookies = session.get_cookies("example.com");
         assert_eq!(cookies.len(), 1);
-        assert_eq!(cookies[0].name, "test");
+    }
+
+    #[test]
+    fn test_state_manager() {
+        let manager = StateManager::new();
+        
+        let state = TcpState::new(1000, 2000, 65535);
+        manager.store_tcp_state("conn1".to_string(), state);
+        
+        let retrieved = manager.get_tcp_state("conn1");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().seq, 1000);
+    }
+
+    #[test]
+    fn test_connection_state_manager() {
+        let manager = ConnectionStateManager::new();
+        
+        let id1 = manager.create_connection();
+        let id2 = manager.create_connection();
+        
+        assert_ne!(id1, id2);
+        assert_eq!(manager.get_active_count(), 2);
+        
+        manager.remove_connection(id1);
+        assert_eq!(manager.get_active_count(), 1);
     }
 }
