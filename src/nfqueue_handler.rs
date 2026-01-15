@@ -2,48 +2,15 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, error, debug};
-use nfqueue::{Queue, Verdict, Message};
+use nfq_updated::{Queue, Message, Verdict};  // <-- ИЗМЕНЕНО
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use crate::config::Config;
 use crate::packet::PacketInterceptor;
 
-// Глобальный interceptor (нужен для callback функции)
+// Глобальный interceptor
 static INTERCEPTOR: Lazy<Mutex<Option<Arc<PacketInterceptor>>>> = Lazy::new(|| Mutex::new(None));
-
-// Callback функция для nfqueue
-fn packet_callback(msg: &Message, _data: &mut ()) {
-    let interceptor = INTERCEPTOR.lock().unwrap();
-    let interceptor = match interceptor.as_ref() {
-        Some(i) => i,
-        None => {
-            error!("Interceptor not initialized");
-            msg.set_verdict(Verdict::Accept);
-            return;
-        }
-    };
-    
-    let packet_data = msg.get_payload();
-    
-    // Обрабатываем через interceptor
-    match interceptor.process_packet(packet_data) {
-        Ok(modified) => {
-            if modified.len() != packet_data.len() || modified != packet_data {
-                // Пакет был модифицирован
-                debug!("Packet modified, size: {} -> {}", packet_data.len(), modified.len());
-                msg.set_verdict_full(Verdict::Drop, 0, &modified);
-            } else {
-                // Пакет не изменился
-                msg.set_verdict(Verdict::Accept);
-            }
-        }
-        Err(e) => {
-            error!("Packet processing error: {}, accepting", e);
-            msg.set_verdict(Verdict::Accept);
-        }
-    }
-}
 
 pub struct NfqueueHandler {
     queue_num: u16,
@@ -58,57 +25,55 @@ impl NfqueueHandler {
         })
     }
     
-    /// Запуск обработки пакетов из NFQUEUE
     pub fn run(&mut self) -> Result<()> {
-        info!("Opening NFQUEUE {}", self.queue_num);
+        info!("Opening NFQUEUE {} with nfq library", self.queue_num);
         
-        // Инициализируем глобальный interceptor
+        // Инициализируем interceptor
         let interceptor = Arc::new(PacketInterceptor::new(self.config.clone()));
-        *INTERCEPTOR.lock().unwrap() = Some(interceptor);
+        *INTERCEPTOR.lock().unwrap() = Some(interceptor.clone());
         
-        let mut queue = Queue::new(());
-        queue.open();
-        queue.bind(libc::AF_INET);
-        queue.create_queue(self.queue_num, packet_callback);
-        queue.set_mode(nfqueue::CopyMode::CopyPacket, 0xffff);
+        // Создаём queue через nfq
+        let mut queue = Queue::open()?;
+        
+        info!("Binding to queue {}", self.queue_num);
+        queue.bind(self.queue_num)?;
         
         info!("✓ NFQUEUE {} ready, processing packets...", self.queue_num);
         
-        queue.run_loop();
-        
-        Ok(())
+        // Обрабатываем пакеты
+        loop {
+            let mut msg = match queue.recv() {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to receive packet: {}", e);
+                    continue;
+                }
+            };
+            
+            let packet_data = msg.get_payload();
+            
+            match interceptor.process_packet(packet_data) {
+                Ok(modified) => {
+                    if modified.len() != packet_data.len() || modified != packet_data {
+                        debug!("Packet modified, size: {} -> {}", packet_data.len(), modified.len());
+                        
+                        // Для модифицированных пакетов: Drop оригинал и inject новый
+                        msg.set_verdict(Verdict::Drop);
+                        
+                        // TODO: Нужно inject модифицированный пакет через raw socket
+                        // Пока просто Accept оригинал (не ломаем соединение)
+                        msg.set_verdict(Verdict::Accept);
+                    } else {
+                        msg.set_verdict(Verdict::Accept);
+                    }
+                }
+                Err(e) => {
+                    error!("Packet processing error: {}, accepting", e);
+                    msg.set_verdict(Verdict::Accept);
+                }
+            }
+        }
     }
-}
-
-/// Setup iptables rules для NFQUEUE
-pub fn setup_iptables(queue_num: u16) -> Result<()> {
-    info!("Setting up iptables rules...");
-    
-    // Очистка старых правил
-    let _ = std::process::Command::new("iptables")
-        .args(&["-t", "mangle", "-F"])
-        .output();
-    
-    // NFQUEUE для HTTPS трафика (port 443)
-    let output = std::process::Command::new("iptables")
-        .args(&[
-            "-t", "mangle",
-            "-A", "PREROUTING",
-            "-p", "tcp",
-            "--dport", "443",
-            "-j", "NFQUEUE",
-            "--queue-num", &queue_num.to_string()
-        ])
-        .output()?;
-    
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("Failed to setup iptables: {}", 
-            String::from_utf8_lossy(&output.stderr)));
-    }
-    
-    info!("✓ iptables rule added: HTTPS -> NFQUEUE {}", queue_num);
-    
-    Ok(())
 }
 
 /// Cleanup iptables rules

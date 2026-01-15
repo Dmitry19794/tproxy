@@ -18,9 +18,11 @@ mod proxy;
 mod challenge;
 mod packet;
 mod nfqueue_handler;
+mod state;
+mod timing;
 
 use config::Config;
-use nfqueue_handler::{NfqueueHandler, setup_iptables, cleanup_iptables};
+use nfqueue_handler::{NfqueueHandler, cleanup_iptables};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
@@ -47,18 +49,10 @@ async fn main() -> Result<()> {
     info!("Cipher suites: {}", profile.cipher_suites.len());
     info!("Extensions: {}", profile.extensions.len());
 
-    // Setup iptables
-    info!("Setting up packet interception...");
-    setup_iptables(0)?;
-    
     // Cleanup on exit
-    let cleanup = || {
+    ctrlc::set_handler(move || {
         info!("Cleaning up...");
         let _ = cleanup_iptables();
-    };
-    
-    ctrlc::set_handler(move || {
-        cleanup();
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
 

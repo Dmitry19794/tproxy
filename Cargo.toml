@@ -24,9 +24,10 @@ metrics-exporter-prometheus = "0.13"
 cookie = "0.18"
 cookie_store = "0.21"
 base64 = "0.21"
-nfqueue = "0.9.1"
 ctrlc = "3.5.1"
 once_cell = "1.21.3"
+nfq-updated = "0.2.6"
+rand_distr = "0.5.1"
 
 [target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
 jemallocator = { version = "0.5", features = ["profiling"] }

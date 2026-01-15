@@ -1,11 +1,0 @@
---2026-01-13 15:36:02--  https://static.rust-lang.org/dist/rust-1.78.0-x86_64-unknown-linux-gnu.tar.gz
-Распознаётся static.rust-lang.org (static.rust-lang.org)… 2a04:4e42::649, 2a04:4e42:200::649, 2a04:4e42:600::649, ...
-Подключение к static.rust-lang.org (static.rust-lang.org)|2a04:4e42::649|:443... соединение установлено.
-HTTP-запрос отправлен. Ожидание ответа… 200 OK
-Длина: 326774226 (312M) [application/x-tar]
-Сохранение в: ‘rust-1.78.0-x86_64-unknown-linux-gnu.tar.gz’
-
-rust-1.78.0-x86_64-unknown-linux-gnu.tar.   0%[                                                                                      ]   2,77M  --.-KB/s    ост 68d 22hrust-1.78.0-x86_64-unknown-linux-gnu.tar.   0%[                                                                                      ]   2,77M  --.-KB/s    за 14h 48m 
-
-2026-01-14 11:49:53 (54,4 B/s) - Ошибка чтения, позиция 2900095/326774226 (Время ожидания соединения истекло). Продолжение попыток.
-
