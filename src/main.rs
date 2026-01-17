@@ -1,6 +1,7 @@
 use tokio::net::TcpListener;
 use std::sync::Arc;
 use anyhow::Result;
+use tokio::signal;
 
 mod config;
 mod proxy;
@@ -17,6 +18,7 @@ mod zerocopy;
 mod graceful;
 mod http2_advanced;
 mod tcp_advanced;
+mod socks5;
 
 use config::Config;
 use proxy::ProxyHandler;
@@ -25,7 +27,6 @@ use proxy::ProxyHandler;
 async fn main() -> Result<()> {
     env_logger::init();
 
-    // Поддержка выбора конфига через аргумент
     let args: Vec<String> = std::env::args().collect();
     let config_path = if args.len() > 1 {
         &args[1]
@@ -38,30 +39,52 @@ async fn main() -> Result<()> {
         Config::default()
     });
     
-    log::info!("Configuration loaded from: {}", config_path);
-    log::info!("Default profile: {}", config.default_profile);
+    log::info!("=================================================");
+    log::info!("TPROXY v2.0 - Transparent Proxy with Fingerprinting");
+    log::info!("=================================================");
+    log::info!("Configuration: {}", config_path);
+    log::info!("Profile: {}", config.default_profile);
     
     if config.proxy_settings.is_direct() {
-        log::info!("Proxy: DIRECT MODE (no upstream proxy)");
+        log::info!("Mode: DIRECT (no upstream proxy)");
     } else {
-        log::info!("Proxy: {}:{} ({})", 
+        log::info!("Mode: {} proxy", config.proxy_settings.proxy_type.to_uppercase());
+        log::info!("Upstream: {}:{}", 
             config.proxy_settings.proxy_host,
-            config.proxy_settings.proxy_port,
-            config.proxy_settings.proxy_type
+            config.proxy_settings.proxy_port
         );
+        if config.proxy_settings.username.is_some() {
+            log::info!("Authentication: enabled");
+        }
     }
+    log::info!("=================================================");
 
     let proxy_handler = Arc::new(ProxyHandler::new(config));
 
-    // Запускаем задачу очистки
+    // Cleanup task
     let cleanup_handler = proxy_handler.clone();
     tokio::spawn(async move {
         cleanup_handler.cleanup_task().await;
     });
 
+    // Graceful shutdown handler
+    let shutdown_handler = proxy_handler.clone();
+    tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                log::info!("Received SIGINT, initiating graceful shutdown...");
+                // Можно добавить логику shutdown
+            }
+            Err(err) => {
+                log::error!("Failed to listen for SIGINT: {}", err);
+            }
+        }
+    });
+
     let listen_addr = "127.0.0.1:8080";
     let listener = TcpListener::bind(listen_addr).await?;
-    log::info!("TPROXY listening on {}", listen_addr);
+    log::info!("✓ Listening on {}", listen_addr);
+    log::info!("Ready to accept connections");
 
     loop {
         match listener.accept().await {

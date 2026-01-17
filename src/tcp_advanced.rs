@@ -3,12 +3,19 @@ use std::time::{Duration, Instant};
 use std::os::unix::io::AsRawFd;
 use std::os::fd::AsFd;
 use anyhow::Result;
+use nix::sys::socket::{setsockopt, sockopt};
 
 const MAX_WINDOW_SIZE: u32 = 1048576;
 const MIN_WINDOW_SIZE: u32 = 8192;
 const WINDOW_SCALE_FACTOR: u8 = 7;
 const RETRANSMIT_TIMEOUT_MS: u64 = 200;
 const MAX_RETRANSMITS: u8 = 3;
+
+// iOS Safari TCP fingerprint constants
+const IOS_TTL: u8 = 64;
+const IOS_MSS: u16 = 1460;
+const IOS_WINDOW_SCALE: u8 = 7;
+const IOS_INITIAL_WINDOW: u32 = 65535;
 
 #[derive(Debug, Clone)]
 pub struct TcpWindowManager {
@@ -323,12 +330,183 @@ impl SackManager {
     }
 }
 
+/// Configure basic TCP socket options
 pub fn configure_tcp_socket<F: AsRawFd + AsFd>(socket: &F) -> Result<()> {
-    use nix::sys::socket::{setsockopt, sockopt};
-    
     setsockopt(socket, sockopt::TcpNoDelay, &true)?;
     setsockopt(socket, sockopt::ReuseAddr, &true)?;
+    setsockopt(socket, sockopt::KeepAlive, &true)?;
     
+    Ok(())
+}
+
+/// Apply iOS Safari TCP fingerprint to socket
+pub fn apply_tcp_options<F: AsRawFd + AsFd>(socket: &F, is_client: bool) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    
+    // Set TTL to iOS default (64)
+    unsafe {
+        let ttl = IOS_TTL as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TTL,
+            &ttl as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            log::warn!("Failed to set TTL: {}", std::io::Error::last_os_error());
+        }
+    }
+    
+    // Set TCP MSS (Maximum Segment Size) - iOS Safari default
+    unsafe {
+        let mss = IOS_MSS as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mss as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            log::warn!("Failed to set MSS: {}", std::io::Error::last_os_error());
+        }
+    }
+    
+    // Set initial window size
+    if is_client {
+        unsafe {
+            let window = IOS_INITIAL_WINDOW as libc::c_int;
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &window as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                log::warn!("Failed to set receive buffer: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+    
+    // Enable TCP timestamps (important for iOS fingerprint)
+    unsafe {
+        let enable = 1 as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            27, // TCP_TIMESTAMP (not in all libc versions)
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            // Не критично, продолжаем
+            log::debug!("TCP_TIMESTAMP not supported or failed");
+        }
+    }
+    
+    // Set congestion control to cubic (iOS default)
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        
+        unsafe {
+            let cubic = CString::new("cubic").unwrap();
+            let ret = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                13, // TCP_CONGESTION
+                cubic.as_ptr() as *const libc::c_void,
+                cubic.as_bytes_with_nul().len() as libc::socklen_t,
+            );
+            if ret < 0 {
+                log::warn!("Failed to set TCP congestion control: {}", std::io::Error::last_os_error());
+            } else {
+                log::debug!("✓ TCP congestion control set to cubic");
+            }
+        }
+    }
+    
+    // Enable SACK (Selective Acknowledgment)
+    setsockopt(socket, sockopt::TcpKeepIdle, &120)?;
+    
+    log::debug!("✓ iOS Safari TCP options applied (TTL={}, MSS={}, Window={})", 
+        IOS_TTL, IOS_MSS, IOS_INITIAL_WINDOW);
+    
+    Ok(())
+}
+
+/// Preserve original TTL from packet (for TPROXY mode)
+pub fn preserve_ttl<F: AsRawFd>(socket: &F, ttl: u8) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    
+    unsafe {
+        let ttl_val = ttl as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TTL,
+            &ttl_val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        
+        if ret < 0 {
+            return Err(anyhow::anyhow!("Failed to preserve TTL: {}", 
+                std::io::Error::last_os_error()));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Enable IP_TRANSPARENT for TPROXY mode
+#[cfg(target_os = "linux")]
+pub fn enable_transparent_proxy<F: AsRawFd>(socket: &F) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    
+    unsafe {
+        let enable = 1 as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            19, // IP_TRANSPARENT
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        
+        if ret < 0 {
+            return Err(anyhow::anyhow!("Failed to enable IP_TRANSPARENT: {}", 
+                std::io::Error::last_os_error()));
+        }
+    }
+    
+    log::debug!("✓ IP_TRANSPARENT enabled");
+    Ok(())
+}
+
+/// Enable IP_RECVORIGDSTADDR to get original destination
+#[cfg(target_os = "linux")]
+pub fn enable_recvorigdstaddr<F: AsRawFd>(socket: &F) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    
+    unsafe {
+        let enable = 1 as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            20, // IP_RECVORIGDSTADDR
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        
+        if ret < 0 {
+            return Err(anyhow::anyhow!("Failed to enable IP_RECVORIGDSTADDR: {}", 
+                std::io::Error::last_os_error()));
+        }
+    }
+    
+    log::debug!("✓ IP_RECVORIGDSTADDR enabled");
     Ok(())
 }
 

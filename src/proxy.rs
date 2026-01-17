@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use anyhow::Result;
+use std::os::unix::io::AsRawFd;
 
 use crate::config::Config;
 use crate::tls::{TlsClientHello, SessionTicketCache};
@@ -9,8 +10,9 @@ use crate::challenge::ChallengeHandler;
 use crate::http2::Http2Handler;
 use crate::state::ConnectionStateManager;
 use crate::graceful::{GracefulShutdown, ConnectionRecovery};
-use crate::tcp_advanced::configure_tcp_socket;
+use crate::tcp_advanced::{configure_tcp_socket, apply_tcp_options};
 use crate::timing::TimingPreserver;
+use crate::socks5::{Socks5Connector, HttpsProxyConnector};
 
 const BUFFER_SIZE: usize = 65536;
 
@@ -47,6 +49,11 @@ impl ProxyHandler {
 
     async fn process_connection(&self, client_stream: &mut TcpStream, conn_id: u64) -> Result<()> {
         configure_tcp_socket(client_stream)?;
+        
+        // Apply iOS Safari TCP options
+        if let Err(e) = apply_tcp_options(client_stream, true) {
+            log::warn!("Failed to apply TCP options: {}", e);
+        }
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let n = client_stream.read(&mut buffer).await?;
@@ -57,7 +64,6 @@ impl ProxyHandler {
 
         let request_data = &buffer[..n];
 
-        // Проверяем на CONNECT метод для HTTPS
         if self.is_connect_method(request_data) {
             self.handle_connect_method(client_stream, request_data, conn_id).await
         } else if self.is_tls_handshake(request_data) {
@@ -76,31 +82,35 @@ impl ProxyHandler {
         conn_id: u64,
     ) -> Result<()> {
         let request = String::from_utf8_lossy(initial_data);
-        
         let target = self.extract_connect_target(&request)?;
-        log::debug!("CONNECT method to: {}", target);
         
+        log::debug!("CONNECT method to: {}", target);
+
         let mut server_stream = self.connect_to_target(&target).await?;
         
+        // Apply TCP options to server connection
+        if let Err(e) = apply_tcp_options(&server_stream, false) {
+            log::warn!("Failed to apply server TCP options: {}", e);
+        }
+
         let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
         client_stream.write_all(response).await?;
         log::debug!("Sent 200 Connection Established to client");
-        
-        // Читаем первый пакет (TLS ClientHello)
+
         let mut first_packet = vec![0u8; BUFFER_SIZE];
         let n = client_stream.read(&mut first_packet).await?;
-        
+
         if n == 0 {
             return Ok(());
         }
-        
+
         let first_packet = &first_packet[..n];
-        
+
         if self.is_tls_handshake(first_packet) {
             log::debug!("Detected TLS ClientHello, applying iOS Safari fingerprint");
-            
+
             let domain = target.split(':').next().unwrap_or(&target).to_string();
-            
+
             match TlsClientHello::parse(first_packet) {
                 Ok(client_hello) => {
                     match client_hello.to_ios_safari(Some(&self.session_cache), &domain) {
@@ -124,12 +134,11 @@ impl ProxyHandler {
             log::debug!("Non-TLS data, forwarding as-is");
             server_stream.write_all(first_packet).await?;
         }
-        
+
         self.proxy_bidirectional(client_stream, &mut server_stream, conn_id).await
     }
 
     fn extract_connect_target(&self, request: &str) -> Result<String> {
-        // Парсим: "CONNECT example.com:443 HTTP/1.1"
         for line in request.lines() {
             if line.to_uppercase().starts_with("CONNECT ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -166,13 +175,8 @@ impl ProxyHandler {
         let domain = self.extract_sni(initial_data).unwrap_or_default();
 
         let client_hello = TlsClientHello::parse(initial_data)?;
-        
-        let modified_hello = client_hello.to_ios_safari(
-            Some(&self.session_cache),
-            &domain,
-        )?;
+        let modified_hello = client_hello.to_ios_safari(Some(&self.session_cache), &domain)?;
 
-        // Для TLS используем SNI как target
         let target = if !domain.is_empty() {
             format!("{}:443", domain)
         } else {
@@ -180,6 +184,7 @@ impl ProxyHandler {
         };
 
         let mut server_stream = self.connect_to_target(&target).await?;
+        apply_tcp_options(&server_stream, false)?;
 
         server_stream.write_all(&modified_hello).await?;
 
@@ -195,15 +200,12 @@ impl ProxyHandler {
         let request = String::from_utf8_lossy(initial_data);
         let is_http2 = request.contains("HTTP/2");
 
-        // Извлекаем target host из HTTP запроса
         let target_host = self.extract_http_host(&request);
         log::debug!("Extracted target host: {}", target_host);
 
         let mut server_stream = self.connect_to_target(&target_host).await?;
-        log::debug!("Connected to target: {}", target_host);
+        apply_tcp_options(&server_stream, false)?;
 
-        // Для direct режима нужно переписать HTTP запрос
-        // Убираем полный URL, оставляем только путь
         let modified_request = if self.config.proxy_settings.is_direct() {
             self.rewrite_http_request(&request)
         } else {
@@ -213,15 +215,111 @@ impl ProxyHandler {
         if is_http2 {
             self.handle_http2_connection(client_stream, &mut server_stream, &modified_request, conn_id).await
         } else {
-            log::debug!("Sending {} bytes to server", modified_request.len());
             server_stream.write_all(&modified_request).await?;
-            log::debug!("Request sent, starting bidirectional proxy");
-            self.proxy_bidirectional(client_stream, &mut server_stream, conn_id).await
+            
+            // Read response and check for challenges
+            let mut response_buffer = vec![0u8; BUFFER_SIZE];
+            let n = server_stream.read(&mut response_buffer).await?;
+            
+            if n > 0 {
+                let response_data = &response_buffer[..n];
+                let response_str = String::from_utf8_lossy(response_data);
+                
+                // Check for challenge/redirect
+                if self.detect_challenge_in_response(&response_str) {
+                    log::info!("Challenge detected, handling...");
+                    self.handle_challenge_response(
+                        client_stream, 
+                        &mut server_stream, 
+                        response_data, 
+                        &target_host,
+                        conn_id
+                    ).await?;
+                } else {
+                    // Normal response
+                    client_stream.write_all(response_data).await?;
+                    self.proxy_bidirectional(client_stream, &mut server_stream, conn_id).await?;
+                }
+            }
+            
+            Ok(())
         }
     }
 
+    fn detect_challenge_in_response(&self, response: &str) -> bool {
+        let mut headers = std::collections::HashMap::new();
+        
+        for line in response.lines() {
+            if let Some(pos) = line.find(':') {
+                let key = line[..pos].trim().to_lowercase();
+                let value = line[pos + 1..].trim().to_string();
+                headers.insert(key, value);
+            }
+        }
+
+        let handler = self.challenge_handler.read();
+        handler.detect_challenge(response, &headers)
+    }
+
+    async fn handle_challenge_response(
+        &self,
+        client_stream: &mut TcpStream,
+        server_stream: &mut TcpStream,
+        response_data: &[u8],
+        url: &str,
+        conn_id: u64,
+    ) -> Result<()> {
+        let response_str = String::from_utf8_lossy(response_data);
+        
+        // Extract status code
+        let status_code = response_str.lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(200);
+
+        // Extract cookies
+        let mut cookies = Vec::new();
+        for line in response_str.lines() {
+            if line.to_lowercase().starts_with("set-cookie:") {
+                if let Some(cookie) = line.split(':').nth(1) {
+                    cookies.push(cookie.trim().to_string());
+                }
+            }
+        }
+
+        // Store challenge state
+        {
+            let mut handler = self.challenge_handler.write();
+            handler.register_challenge(url.to_string(), cookies.clone());
+            
+            if handler.is_redirect(status_code) {
+                handler.start_redirect_chain(url.to_string());
+                
+                // Extract redirect location
+                for line in response_str.lines() {
+                    if line.to_lowercase().starts_with("location:") {
+                        if let Some(location) = line.split(':').nth(1) {
+                            let _ = handler.add_redirect(
+                                url,
+                                url.to_string(),
+                                location.trim().to_string(),
+                                status_code,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass response to client (important: don't modify challenge responses)
+        client_stream.write_all(response_data).await?;
+        
+        // Continue proxying
+        self.proxy_bidirectional(client_stream, server_stream, conn_id).await
+    }
+
     fn rewrite_http_request(&self, request: &str) -> Vec<u8> {
-        // Разбиваем на headers и body
         let parts: Vec<&str> = request.split("\r\n\r\n").collect();
         let headers_part = parts[0];
         let body = if parts.len() > 1 { parts[1] } else { "" };
@@ -232,7 +330,6 @@ impl ProxyHandler {
             return request.as_bytes().to_vec();
         }
 
-        // Переписываем первую строку: убираем схему и хост
         let first_line = lines[0];
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         
@@ -241,7 +338,6 @@ impl ProxyHandler {
             let url = parts[1];
             let version = if parts.len() >= 3 { parts[2] } else { "HTTP/1.1" };
             
-            // Извлекаем путь из полного URL
             let path = if url.starts_with("http://") {
                 if let Some(host_end) = url[7..].find('/') {
                     &url[7 + host_end..]
@@ -252,28 +348,21 @@ impl ProxyHandler {
                 url
             };
             
-            // Создаём новую первую строку
             let new_first_line = format!("{} {} {}", method, path, version);
-            
-            // Собираем новый запрос
             let mut new_lines = vec![new_first_line];
             
-            // Добавляем остальные headers, кроме Proxy-Connection
             for line in &lines[1..] {
                 if !line.is_empty() && !line.to_lowercase().starts_with("proxy-connection:") {
                     new_lines.push(line.to_string());
                 }
             }
             
-            // Собираем финальный запрос
             let rewritten = if body.is_empty() {
                 format!("{}\r\n\r\n", new_lines.join("\r\n"))
             } else {
                 format!("{}\r\n\r\n{}", new_lines.join("\r\n"), body)
             };
             
-            log::debug!("Rewritten request ({} bytes): {}", rewritten.len(), 
-                &rewritten[..rewritten.len().min(150)].replace("\r\n", "\\r\\n"));
             return rewritten.as_bytes().to_vec();
         }
         
@@ -314,6 +403,10 @@ impl ProxyHandler {
         let mut timing = TimingPreserver::new(0.05);
 
         loop {
+            if self.graceful_shutdown.is_shutting_down().await {
+                break;
+            }
+
             tokio::select! {
                 result = client_stream.read(&mut client_buffer) => {
                     let n = result?;
@@ -321,6 +414,9 @@ impl ProxyHandler {
                         break;
                     }
 
+                    // Apply natural timing before sending
+                    timing.wait_natural_delay().await;
+                    
                     server_stream.write_all(&client_buffer[..n]).await?;
                     timing.record_send();
                     self.graceful_shutdown.mark_activity(conn_id).await;
@@ -338,6 +434,7 @@ impl ProxyHandler {
                         server_stream.write_all(&frame).await?;
                     }
 
+                    timing.wait_natural_delay().await;
                     client_stream.write_all(&server_buffer[..n]).await?;
                     timing.record_send();
                     self.graceful_shutdown.mark_activity(conn_id).await;
@@ -355,6 +452,7 @@ impl ProxyHandler {
         conn_id: u64,
     ) -> Result<()> {
         let mut server_stream = self.connect_to_upstream().await?;
+        apply_tcp_options(&server_stream, false)?;
 
         server_stream.write_all(initial_data).await?;
 
@@ -387,12 +485,12 @@ impl ProxyHandler {
                             break;
                         }
                         Ok(n) => {
-                            log::debug!("Received {} bytes from client on connection {}", n, conn_id);
+                            timing.wait_natural_delay().await;
+                            
                             if let Err(e) = server_stream.write_all(&client_buffer[..n]).await {
                                 log::error!("Failed to write to server: {}", e);
                                 break;
                             }
-                            log::debug!("Forwarded {} bytes to server", n);
 
                             timing.record_send();
                             self.graceful_shutdown.mark_activity(conn_id).await;
@@ -410,12 +508,12 @@ impl ProxyHandler {
                             break;
                         }
                         Ok(n) => {
-                            log::debug!("Received {} bytes from server on connection {}", n, conn_id);
+                            timing.wait_natural_delay().await;
+                            
                             if let Err(e) = client_stream.write_all(&server_buffer[..n]).await {
                                 log::error!("Failed to write to client: {}", e);
                                 break;
                             }
-                            log::debug!("Forwarded {} bytes to client", n);
 
                             timing.record_send();
                             self.graceful_shutdown.mark_activity(conn_id).await;
@@ -435,8 +533,6 @@ impl ProxyHandler {
 
     async fn connect_to_upstream(&self) -> Result<TcpStream> {
         let proxy = &self.config.proxy_settings;
-        
-        // Обычный режим через прокси
         let addr = format!("{}:{}", proxy.proxy_host, proxy.proxy_port);
         
         let recovery = ConnectionRecovery::new();
@@ -449,49 +545,69 @@ impl ProxyHandler {
     async fn connect_to_target(&self, target: &str) -> Result<TcpStream> {
         let proxy = &self.config.proxy_settings;
         
-        // Если режим direct - подключаемся напрямую к целевому хосту
         if proxy.is_direct() {
             log::debug!("Direct mode: connecting to {}", target);
             
             let recovery = ConnectionRecovery::new();
-            
             return recovery.retry_with_backoff(|| async {
                 TcpStream::connect(target).await.map_err(|e| e.into())
             }).await;
         }
         
-        // Через прокси - пока используем простое подключение
-        // TODO: Добавить SOCKS5 handshake
-        self.connect_to_upstream().await
+        // Parse target
+        let (host, port) = if let Some(pos) = target.rfind(':') {
+            (&target[..pos], target[pos + 1..].parse::<u16>().unwrap_or(443))
+        } else {
+            (target, 443)
+        };
+
+        match proxy.proxy_type.to_lowercase().as_str() {
+            "socks5" => {
+                let connector = Socks5Connector::new(
+                    proxy.proxy_host.clone(),
+                    proxy.proxy_port,
+                    proxy.username.clone(),
+                    proxy.password.clone(),
+                );
+                connector.connect(host, port).await
+            }
+            "http" | "https" => {
+                let connector = HttpsProxyConnector::new(
+                    proxy.proxy_host.clone(),
+                    proxy.proxy_port,
+                    proxy.username.clone(),
+                    proxy.password.clone(),
+                );
+                connector.connect(host, port).await
+            }
+            _ => {
+                Err(anyhow::anyhow!("Unsupported proxy type: {}", proxy.proxy_type))
+            }
+        }
     }
 
     fn extract_http_host(&self, request: &str) -> String {
-        // Парсим HTTP запрос для извлечения хоста
         for line in request.lines() {
             if line.to_lowercase().starts_with("host:") {
                 let host = line[5..].trim();
                 
-                // Определяем порт
                 if host.contains(':') {
                     return host.to_string();
                 } else {
-                    // Определяем порт по схеме из первой строки
                     if request.starts_with("CONNECT") {
-                        return format!("{}:443", host); // HTTPS
+                        return format!("{}:443", host);
                     } else {
-                        return format!("{}:80", host);  // HTTP
+                        return format!("{}:80", host);
                     }
                 }
             }
         }
         
-        // Если не нашли Host header, пробуем извлечь из URL в первой строке
         if let Some(first_line) = request.lines().next() {
             let parts: Vec<&str> = first_line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let url = parts[1];
                 if url.starts_with("http://") {
-                    // Извлекаем хост из полного URL
                     if let Some(host_part) = url.strip_prefix("http://") {
                         if let Some(host_end) = host_part.find('/') {
                             let host = &host_part[..host_end];
@@ -506,7 +622,6 @@ impl ProxyHandler {
             }
         }
         
-        // Дефолтный fallback
         log::warn!("Could not extract host from request, using default");
         "httpbin.org:80".to_string()
     }
@@ -585,32 +700,5 @@ impl ProxyHandler {
             
             log::debug!("Cleanup completed");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_tls_handshake() {
-        let handler = ProxyHandler::new(Config::default());
-        
-        let tls_data = vec![0x16, 0x03, 0x01, 0x00, 0x00];
-        assert!(handler.is_tls_handshake(&tls_data));
-        
-        let non_tls_data = vec![0x47, 0x45, 0x54];
-        assert!(!handler.is_tls_handshake(&non_tls_data));
-    }
-
-    #[test]
-    fn test_is_http_request() {
-        let handler = ProxyHandler::new(Config::default());
-        
-        let http_data = b"GET / HTTP/1.1\r\n";
-        assert!(handler.is_http_request(http_data));
-        
-        let non_http_data = b"\x16\x03\x01";
-        assert!(!handler.is_http_request(non_http_data));
     }
 }

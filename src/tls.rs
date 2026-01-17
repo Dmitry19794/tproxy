@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TLS_HANDSHAKE: u8 = 0x16;
-const TLS_VERSION_1_0: [u8; 2] = [0x03, 0x01]; // Legacy version in record
-const TLS_VERSION_1_2: [u8; 2] = [0x03, 0x03]; // Legacy version in handshake
+const TLS_VERSION_1_0: [u8; 2] = [0x03, 0x01];
+const TLS_VERSION_1_2: [u8; 2] = [0x03, 0x03];
 const CLIENT_HELLO: u8 = 0x01;
 const SESSION_TICKET_LIFETIME: u64 = 7200;
 
@@ -111,7 +111,7 @@ impl TlsClientHello {
             return Err(anyhow::anyhow!("Not a ClientHello"));
         }
 
-        let mut offset = 6; // Skip handshake type (1) + length (3) + version (2)
+        let mut offset = 6;
         
         let mut random = [0u8; 32];
         random.copy_from_slice(&handshake_data[offset..offset + 32]);
@@ -188,10 +188,8 @@ impl TlsClientHello {
         })
     }
 
+    /// Совместимая версия - минимальные изменения оригинального ClientHello
     pub fn to_ios_safari(&self, _ticket_cache: Option<&SessionTicketCache>, domain: &str) -> Result<Vec<u8>> {
-        let mut rng = rand::rng();
-        
-        // TLS Record Header
         let mut result = BytesMut::new();
         result.put_u8(TLS_HANDSHAKE);
         result.put_slice(&TLS_VERSION_1_0);
@@ -201,35 +199,43 @@ impl TlsClientHello {
         
         let mut client_hello = BytesMut::new();
         
-        // Legacy version
+        // Используем оригинальную версию
         client_hello.put_slice(&TLS_VERSION_1_2);
         
-        // Random - используем оригинальный для сохранения сессии
+        // Сохраняем оригинальный random (ВАЖНО для session resumption)
         client_hello.put_slice(&self.random);
         
-        // Session ID - используем оригинальный
+        // Сохраняем оригинальный session ID
         client_hello.put_u8(self.session_id.len() as u8);
-        client_hello.put_slice(&self.session_id);
+        if !self.session_id.is_empty() {
+            client_hello.put_slice(&self.session_id);
+        }
         
-        // Cipher Suites - подменяем на iOS Safari порядок
-        let ciphers = vec![
-            0x1301, 0x1302, 0x1303, // TLS 1.3 ciphers
-            0xc02c, 0xc02b, 0xc030, 0xc02f, // ECDHE
-            0xcca9, 0xcca8, // ChaCha20
-            0x00ff, // Renegotiation
-        ];
+        // Cipher Suites - используем ОРИГИНАЛЬНЫЕ + добавляем TLS 1.3 в начало
+        let mut ciphers = Vec::new();
+        
+        // Добавляем TLS 1.3 ciphers в начало (если их нет)
+        let tls13_ciphers = vec![0x1301, 0x1302, 0x1303];
+        for cipher in &tls13_ciphers {
+            if !self.cipher_suites.contains(cipher) {
+                ciphers.push(*cipher);
+            }
+        }
+        
+        // Добавляем все оригинальные cipher suites
+        ciphers.extend_from_slice(&self.cipher_suites);
         
         client_hello.put_u16(ciphers.len() as u16 * 2);
         for cipher in ciphers {
             client_hello.put_u16(cipher);
         }
         
-        // Compression - используем оригинальный
+        // Compression - оригинальный
         client_hello.put_u8(self.compression_methods.len() as u8);
         client_hello.put_slice(&self.compression_methods);
         
-        // Extensions - используем оригинальные критичные, подменяем порядок
-        let extensions = self.reorder_extensions_ios_safari(domain);
+        // Extensions - ИСПОЛЬЗУЕМ ОРИГИНАЛЬНЫЕ, только обновляем SNI
+        let extensions = self.update_sni_in_extensions(domain);
         let extensions_bytes = Self::serialize_extensions(&extensions);
         client_hello.put_u16(extensions_bytes.len() as u16);
         client_hello.put_slice(&extensions_bytes);
@@ -246,150 +252,44 @@ impl TlsClientHello {
         Ok(result.to_vec())
     }
 
-    fn reorder_extensions_ios_safari(&self, domain: &str) -> Vec<TlsExtension> {
+    /// Обновляет только SNI extension, остальные сохраняет
+    fn update_sni_in_extensions(&self, domain: &str) -> Vec<TlsExtension> {
         let mut extensions = Vec::new();
+        let mut sni_found = false;
         
-        // 1. SNI - подменяем на правильный домен
-        let mut sni_data = BytesMut::new();
-        sni_data.put_u16((domain.len() + 3) as u16);
-        sni_data.put_u8(0);
-        sni_data.put_u16(domain.len() as u16);
-        sni_data.put_slice(domain.as_bytes());
-        
-        extensions.push(TlsExtension {
-            extension_type: 0,
-            data: sni_data.to_vec(),
-        });
-        
-        // 2-5. Берём оригинальные extensions в правильном порядке iOS Safari
-        let ios_order = [
-            23,    // extended_master_secret
-            65281, // renegotiation_info
-            10,    // supported_groups
-            11,    // ec_point_formats
-            16,    // ALPN
-            13,    // signature_algorithms  
-            43,    // supported_versions (критично!)
-            51,    // key_share (критично!)
-            45,    // psk_key_exchange_modes
-        ];
-        
-        for &ext_type in &ios_order {
-            if let Some(original) = self.find_extension(ext_type) {
-                extensions.push(original.clone());
+        for ext in &self.extensions {
+            if ext.extension_type == 0 {
+                // Заменяем SNI на правильный домен
+                let mut sni_data = BytesMut::new();
+                sni_data.put_u16((domain.len() + 3) as u16);
+                sni_data.put_u8(0);
+                sni_data.put_u16(domain.len() as u16);
+                sni_data.put_slice(domain.as_bytes());
+                
+                extensions.push(TlsExtension {
+                    extension_type: 0,
+                    data: sni_data.to_vec(),
+                });
+                sni_found = true;
+            } else {
+                // Все остальные extensions - БЕЗ ИЗМЕНЕНИЙ
+                extensions.push(ext.clone());
             }
         }
         
-        extensions
-    }
-
-    fn find_extension(&self, ext_type: u16) -> Option<&TlsExtension> {
-        self.extensions.iter().find(|e| e.extension_type == ext_type)
-    }
-
-    fn build_ios_safari_extensions(&self, domain: &str) -> Vec<TlsExtension> {
-        let mut extensions = Vec::new();
-        let mut rng = rand::rng();
-        
-        // Extension 0: server_name (SNI)
-        let mut sni_data = BytesMut::new();
-        sni_data.put_u16((domain.len() + 3) as u16); // list length
-        sni_data.put_u8(0); // name type: hostname
-        sni_data.put_u16(domain.len() as u16);
-        sni_data.put_slice(domain.as_bytes());
-        
-        extensions.push(TlsExtension {
-            extension_type: 0,
-            data: sni_data.to_vec(),
-        });
-        
-        // Extension 23: extended_master_secret
-        extensions.push(TlsExtension {
-            extension_type: 23,
-            data: vec![],
-        });
-        
-        // Extension 65281: renegotiation_info
-        extensions.push(TlsExtension {
-            extension_type: 65281,
-            data: vec![0x00],
-        });
-        
-        // Extension 10: supported_groups
-        extensions.push(TlsExtension {
-            extension_type: 10,
-            data: vec![
-                0x00, 0x08, // length: 8 bytes
-                0x00, 0x1d, // x25519
-                0x00, 0x17, // secp256r1
-                0x00, 0x18, // secp384r1
-                0x00, 0x19, // secp521r1
-            ],
-        });
-        
-        // Extension 11: ec_point_formats
-        extensions.push(TlsExtension {
-            extension_type: 11,
-            data: vec![0x01, 0x00], // uncompressed
-        });
-        
-        // Extension 16: application_layer_protocol_negotiation (ALPN)
-        extensions.push(TlsExtension {
-            extension_type: 16,
-            data: vec![
-                0x00, 0x0c, // length: 12
-                0x02, 0x68, 0x32, // h2
-                0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31, // http/1.1
-            ],
-        });
-        
-        // Extension 13: signature_algorithms
-        extensions.push(TlsExtension {
-            extension_type: 13,
-            data: vec![
-                0x00, 0x14, // length: 20 bytes
-                0x04, 0x03, // ecdsa_secp256r1_sha256
-                0x08, 0x04, // rsa_pss_rsae_sha256
-                0x04, 0x01, // rsa_pkcs1_sha256
-                0x05, 0x03, // ecdsa_secp384r1_sha384
-                0x08, 0x05, // rsa_pss_rsae_sha384
-                0x05, 0x01, // rsa_pkcs1_sha384
-                0x08, 0x06, // rsa_pss_rsae_sha512
-                0x06, 0x01, // rsa_pkcs1_sha512
-                0x02, 0x01, // rsa_pkcs1_sha1
-            ],
-        });
-        
-        // Extension 43: supported_versions (КРИТИЧНО для TLS 1.3!)
-        extensions.push(TlsExtension {
-            extension_type: 43,
-            data: vec![
-                0x04, // length: 4 bytes
-                0x03, 0x04, // TLS 1.3
-                0x03, 0x03, // TLS 1.2
-            ],
-        });
-        
-        // Extension 51: key_share (КРИТИЧНО для TLS 1.3!)
-        let mut key_share = BytesMut::new();
-        key_share.put_u16(0x0024); // length: 36 bytes
-        key_share.put_u16(0x001d); // group: x25519
-        key_share.put_u16(0x0020); // key_exchange length: 32 bytes
-        // Генерируем случайный public key (32 bytes для x25519)
-        for _ in 0..32 {
-            key_share.put_u8(rng.random_range(0..=255));
+        // Если SNI не было, добавляем
+        if !sni_found {
+            let mut sni_data = BytesMut::new();
+            sni_data.put_u16((domain.len() + 3) as u16);
+            sni_data.put_u8(0);
+            sni_data.put_u16(domain.len() as u16);
+            sni_data.put_slice(domain.as_bytes());
+            
+            extensions.insert(0, TlsExtension {
+                extension_type: 0,
+                data: sni_data.to_vec(),
+            });
         }
-        
-        extensions.push(TlsExtension {
-            extension_type: 51,
-            data: key_share.to_vec(),
-        });
-        
-        // Extension 45: psk_key_exchange_modes
-        extensions.push(TlsExtension {
-            extension_type: 45,
-            data: vec![0x01, 0x01], // psk_dhe_ke
-        });
         
         extensions
     }
