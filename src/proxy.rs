@@ -77,20 +77,54 @@ impl ProxyHandler {
     ) -> Result<()> {
         let request = String::from_utf8_lossy(initial_data);
         
-        // Парсим CONNECT запрос: "CONNECT host:port HTTP/1.1"
         let target = self.extract_connect_target(&request)?;
-        
         log::debug!("CONNECT method to: {}", target);
         
-        // Подключаемся к target
         let mut server_stream = self.connect_to_target(&target).await?;
         
-        // Отправляем клиенту 200 Connection Established
         let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
         client_stream.write_all(response).await?;
         log::debug!("Sent 200 Connection Established to client");
         
-        // Теперь начинаем прозрачное проксирование (для TLS handshake и далее)
+        // Читаем первый пакет (TLS ClientHello)
+        let mut first_packet = vec![0u8; BUFFER_SIZE];
+        let n = client_stream.read(&mut first_packet).await?;
+        
+        if n == 0 {
+            return Ok(());
+        }
+        
+        let first_packet = &first_packet[..n];
+        
+        if self.is_tls_handshake(first_packet) {
+            log::debug!("Detected TLS ClientHello, applying iOS Safari fingerprint");
+            
+            let domain = target.split(':').next().unwrap_or(&target).to_string();
+            
+            match TlsClientHello::parse(first_packet) {
+                Ok(client_hello) => {
+                    match client_hello.to_ios_safari(Some(&self.session_cache), &domain) {
+                        Ok(modified_hello) => {
+                            log::info!("✓ TLS fingerprint applied: {} ({}→{} bytes)", 
+                                domain, first_packet.len(), modified_hello.len());
+                            server_stream.write_all(&modified_hello).await?;
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to generate iOS ClientHello: {}, using original", e);
+                            server_stream.write_all(first_packet).await?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse ClientHello: {}, using original", e);
+                    server_stream.write_all(first_packet).await?;
+                }
+            }
+        } else {
+            log::debug!("Non-TLS data, forwarding as-is");
+            server_stream.write_all(first_packet).await?;
+        }
+        
         self.proxy_bidirectional(client_stream, &mut server_stream, conn_id).await
     }
 
