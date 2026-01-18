@@ -414,9 +414,7 @@ impl ProxyHandler {
                         break;
                     }
 
-                    // Apply natural timing before sending
                     timing.wait_natural_delay().await;
-                    
                     server_stream.write_all(&client_buffer[..n]).await?;
                     timing.record_send();
                     self.graceful_shutdown.mark_activity(conn_id).await;
@@ -427,8 +425,13 @@ impl ProxyHandler {
                         break;
                     }
 
-                    http2_handler.handle_incoming_frame(&server_buffer[..n])?;
+                    // Process HTTP/2 frame and get response frames
+                    let response_frames = http2_handler.handle_incoming_frame(&server_buffer[..n])?;
+                    if !response_frames.is_empty() {
+                        server_stream.write_all(&response_frames).await?;
+                    }
 
+                    // Check and send window updates
                     let window_updates = http2_handler.check_and_send_window_updates();
                     for frame in window_updates {
                         server_stream.write_all(&frame).await?;
