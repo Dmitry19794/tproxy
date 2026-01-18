@@ -1,0 +1,11 @@
+{
+  "profiles": [{"name": "ios_safari", "cipher_suites": ["TLS_AES_128_GCM_SHA256"], "extensions": ["server_name"], "supported_versions": ["TLS 1.3"], "alpn": ["h2"], "signature_algorithms": ["ecdsa_secp256r1_sha256"], "key_share_groups": ["x25519"], "psk_key_exchange_modes": ["psk_dhe_ke"], "compress_certificate": ["brotli"]}],
+  "default_profile": "ios_safari",
+  "proxy_settings": {
+    "proxy_host": "64.188.81.172",
+    "proxy_port": 10524,
+    "proxy_type": "socks5",
+    "username": null,
+    "password": null
+  }
+}

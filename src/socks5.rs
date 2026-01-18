@@ -37,7 +37,14 @@ impl Socks5Connector {
 
     pub async fn connect(&self, target_host: &str, target_port: u16) -> Result<TcpStream> {
         let proxy_addr = format!("{}:{}", self.proxy_host, self.proxy_port);
-        let mut stream = TcpStream::connect(&proxy_addr).await
+        
+        log::debug!("Attempting SOCKS5 connection to {} via {}", target_host, proxy_addr);
+        
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect(&proxy_addr)
+        ).await
+            .context("SOCKS5 proxy connection timeout")?
             .context("Failed to connect to SOCKS5 proxy")?;
 
         log::debug!("Connected to SOCKS5 proxy at {}", proxy_addr);
@@ -61,12 +68,21 @@ impl Socks5Connector {
         let mut request = vec![SOCKS5_VERSION, auth_methods.len() as u8];
         request.extend_from_slice(&auth_methods);
 
+        log::debug!("Sending SOCKS5 handshake: {:?}", request);
+
         stream.write_all(&request).await
             .context("Failed to send SOCKS5 handshake")?;
 
         let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await
+        
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut response)
+        ).await
+            .context("SOCKS5 handshake timeout")?
             .context("Failed to read SOCKS5 handshake response")?;
+
+        log::debug!("SOCKS5 handshake response: {:?}", response);
 
         if response[0] != SOCKS5_VERSION {
             return Err(anyhow::anyhow!("Invalid SOCKS5 version in response: {}", response[0]));

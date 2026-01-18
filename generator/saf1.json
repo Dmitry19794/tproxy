@@ -1,0 +1,47 @@
+{
+  "profiles": [
+    {
+      "name": "safari1",
+      "cipher_suites": [
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256"
+      ],
+      "extensions": [
+        "server_name",
+        "supported_versions",
+        "signature_algorithms",
+        "key_share",
+        "psk_key_exchange_modes",
+        "compress_certificate"
+      ],
+      "supported_versions": [
+        "TLS 1.3"
+      ],
+      "alpn": [
+        "h2",
+        "http/1.1"
+      ],
+      "signature_algorithms": [
+        "ecdsa_secp256r1_sha256"
+      ],
+      "key_share_groups": [
+        "x25519"
+      ],
+      "psk_key_exchange_modes": [
+        "psk_dhe_ke"
+      ],
+      "compress_certificate": [
+        "brotli"
+      ]
+    }
+  ],
+  "default_profile": "safari1",
+  "proxy_settings": {
+    "proxy_host": "127.0.0.1",
+    "proxy_port": 1080,
+    "proxy_type": "socks5",
+    "username": null,
+    "password": null
+  }
+}
