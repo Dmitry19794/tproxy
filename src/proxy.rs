@@ -2,7 +2,6 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use anyhow::Result;
-use std::os::unix::io::AsRawFd;
 
 use crate::config::Config;
 use crate::tls::{TlsClientHello, SessionTicketCache};
@@ -11,7 +10,7 @@ use crate::http2::Http2Handler;
 use crate::state::ConnectionStateManager;
 use crate::graceful::{GracefulShutdown, ConnectionRecovery};
 use crate::tcp_advanced::{configure_tcp_socket, apply_tcp_options};
-use crate::timing::TimingPreserver;
+use crate::timing::{TimingPreserver, AdaptiveTiming};
 use crate::socks5::{Socks5Connector, HttpsProxyConnector};
 
 const BUFFER_SIZE: usize = 65536;
@@ -48,11 +47,11 @@ impl ProxyHandler {
     }
 
     async fn process_connection(&self, client_stream: &mut TcpStream, conn_id: u64) -> Result<()> {
+        // Применяем iOS Safari TCP fingerprint
         configure_tcp_socket(client_stream)?;
         
-        // Apply iOS Safari TCP options
         if let Err(e) = apply_tcp_options(client_stream, true) {
-            log::warn!("Failed to apply TCP options: {}", e);
+            log::warn!("Failed to apply iOS TCP options: {}", e);
         }
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
@@ -84,11 +83,16 @@ impl ProxyHandler {
         let request = String::from_utf8_lossy(initial_data);
         let target = self.extract_connect_target(&request)?;
         
-        log::debug!("CONNECT method to: {}", target);
+        // Определяем User-Agent для автодетекта
+        let user_agent = self.extract_user_agent(&request);
+        let is_browser = self.is_browser_user_agent(&user_agent);
+        
+        log::debug!("CONNECT method to: {} | User-Agent: {} | Browser: {}", 
+            target, user_agent, is_browser);
 
         let mut server_stream = self.connect_to_target(&target).await?;
         
-        // Apply TCP options to server connection
+        // Применяем iOS TCP fingerprint к серверному соединению
         if let Err(e) = apply_tcp_options(&server_stream, false) {
             log::warn!("Failed to apply server TCP options: {}", e);
         }
@@ -107,20 +111,32 @@ impl ProxyHandler {
         let first_packet = &first_packet[..n];
 
         if self.is_tls_handshake(first_packet) {
-            log::debug!("Detected TLS ClientHello, applying iOS Safari fingerprint");
-
             let domain = target.split(':').next().unwrap_or(&target).to_string();
 
             match TlsClientHello::parse(first_packet) {
                 Ok(client_hello) => {
-                    match client_hello.to_ios_safari(Some(&self.session_cache), &domain) {
+                    // АВТОДЕТЕКТ: браузер → iOS Safari, curl/wget → passthrough
+                    let modified_result = if is_browser {
+                        log::debug!("Browser detected, applying iOS Safari fingerprint");
+                        client_hello.to_ios_safari(Some(&self.session_cache), &domain)
+                    } else {
+                        log::debug!("CLI tool detected, using passthrough mode");
+                        client_hello.passthrough(&domain)
+                    };
+                    
+                    match modified_result {
                         Ok(modified_hello) => {
-                            log::info!("✓ TLS fingerprint applied: {} ({}→{} bytes)", 
-                                domain, first_packet.len(), modified_hello.len());
+                            if is_browser {
+                                log::info!("✓ TLS iOS Safari fingerprint applied: {} ({}→{} bytes, GREASE enabled)", 
+                                    domain, first_packet.len(), modified_hello.len());
+                            } else {
+                                log::info!("✓ TLS passthrough (SNI updated): {} ({}→{} bytes)", 
+                                    domain, first_packet.len(), modified_hello.len());
+                            }
                             server_stream.write_all(&modified_hello).await?;
                         }
                         Err(e) => {
-                            log::warn!("Failed to generate iOS ClientHello: {}, using original", e);
+                            log::warn!("Failed to process ClientHello: {}, using original", e);
                             server_stream.write_all(first_packet).await?;
                         }
                     }
@@ -150,6 +166,50 @@ impl ProxyHandler {
         Err(anyhow::anyhow!("Could not extract CONNECT target"))
     }
 
+    /// Извлекает User-Agent из HTTP запроса
+    fn extract_user_agent(&self, request: &str) -> String {
+        for line in request.lines() {
+            if line.to_lowercase().starts_with("user-agent:") {
+                return line[11..].trim().to_string();
+            }
+        }
+        "unknown".to_string()
+    }
+
+    /// Определяет является ли User-Agent браузером
+    fn is_browser_user_agent(&self, user_agent: &str) -> bool {
+        let ua_lower = user_agent.to_lowercase();
+        
+        // CLI tools (passthrough mode)
+        let cli_tools = [
+            "curl", "wget", "python", "go-http-client", 
+            "java", "okhttp", "axios", "node-fetch",
+            "http.rb", "perl", "ruby", "php",
+        ];
+        
+        for tool in &cli_tools {
+            if ua_lower.contains(tool) {
+                return false; // CLI tool → passthrough
+            }
+        }
+        
+        // Browsers (iOS Safari fingerprint mode)
+        let browsers = [
+            "mozilla", "firefox", "chrome", "safari", 
+            "edge", "opera", "brave", "vivaldi",
+            "applewebkit", "gecko",
+        ];
+        
+        for browser in &browsers {
+            if ua_lower.contains(browser) {
+                return true; // Browser → iOS Safari fingerprint
+            }
+        }
+        
+        // По умолчанию - passthrough (безопаснее)
+        false
+    }
+
     fn is_connect_method(&self, data: &[u8]) -> bool {
         data.len() >= 7 && data[..7].eq_ignore_ascii_case(b"CONNECT")
     }
@@ -175,7 +235,9 @@ impl ProxyHandler {
         let domain = self.extract_sni(initial_data).unwrap_or_default();
 
         let client_hello = TlsClientHello::parse(initial_data)?;
-        let modified_hello = client_hello.to_ios_safari(Some(&self.session_cache), &domain)?;
+        
+        // PASSTHROUGH режим для совместимости
+        let modified_hello = client_hello.passthrough(&domain)?;
 
         let target = if !domain.is_empty() {
             format!("{}:443", domain)
@@ -186,6 +248,7 @@ impl ProxyHandler {
         let mut server_stream = self.connect_to_target(&target).await?;
         apply_tcp_options(&server_stream, false)?;
 
+        log::info!("✓ TLS passthrough (SNI updated) to {}", domain);
         server_stream.write_all(&modified_hello).await?;
 
         self.proxy_bidirectional(client_stream, &mut server_stream, conn_id).await
@@ -213,6 +276,7 @@ impl ProxyHandler {
         };
 
         if is_http2 {
+            log::info!("✓ HTTP/2 iOS Safari fingerprint will be applied");
             self.handle_http2_connection(client_stream, &mut server_stream, &modified_request, conn_id).await
         } else {
             server_stream.write_all(&modified_request).await?;
@@ -227,7 +291,7 @@ impl ProxyHandler {
                 
                 // Check for challenge/redirect
                 if self.detect_challenge_in_response(&response_str) {
-                    log::info!("Challenge detected, handling...");
+                    log::info!("⚠ Challenge detected, handling transparently...");
                     self.handle_challenge_response(
                         client_stream, 
                         &mut server_stream, 
@@ -288,7 +352,7 @@ impl ProxyHandler {
             }
         }
 
-        // Store challenge state
+        // Store challenge state (НЕ модифицируем challenge responses!)
         {
             let mut handler = self.challenge_handler.write();
             handler.register_challenge(url.to_string(), cookies.clone());
@@ -312,7 +376,7 @@ impl ProxyHandler {
             }
         }
 
-        // Pass response to client (important: don't modify challenge responses)
+        // ВАЖНО: Передаем challenge БЕЗ ИЗМЕНЕНИЙ
         client_stream.write_all(response_data).await?;
         
         // Continue proxying
@@ -376,10 +440,14 @@ impl ProxyHandler {
         initial_data: &[u8],
         conn_id: u64,
     ) -> Result<()> {
+        // Создаем HTTP/2 handler с iOS Safari настройками
         let mut http2_handler = Http2Handler::new_ios_safari();
 
+        // Отправляем iOS Safari preface + SETTINGS
         let preface = http2_handler.build_connection_preface();
         server_stream.write_all(&preface).await?;
+        
+        log::info!("✓ HTTP/2 iOS Safari SETTINGS sent (exact Akamai fingerprint)");
 
         server_stream.write_all(initial_data).await?;
 
@@ -400,7 +468,10 @@ impl ProxyHandler {
     ) -> Result<()> {
         let mut client_buffer = vec![0u8; BUFFER_SIZE];
         let mut server_buffer = vec![0u8; BUFFER_SIZE];
-        let mut timing = TimingPreserver::new(0.05);
+        
+        // Используем iOS Safari timing
+        let mut timing = TimingPreserver::ios_safari();
+        let mut adaptive = AdaptiveTiming::new();
 
         loop {
             if self.graceful_shutdown.is_shutting_down().await {
@@ -414,7 +485,9 @@ impl ProxyHandler {
                         break;
                     }
 
+                    // Естественная задержка iOS Safari
                     timing.wait_natural_delay().await;
+                    
                     server_stream.write_all(&client_buffer[..n]).await?;
                     timing.record_send();
                     self.graceful_shutdown.mark_activity(conn_id).await;
@@ -425,15 +498,16 @@ impl ProxyHandler {
                         break;
                     }
 
-                    // Process HTTP/2 frame and get response frames
+                    // Process HTTP/2 frame
                     let response_frames = http2_handler.handle_incoming_frame(&server_buffer[..n])?;
                     if !response_frames.is_empty() {
                         server_stream.write_all(&response_frames).await?;
                     }
 
-                    // Check and send window updates
+                    // WINDOW_UPDATE с естественными интервалами (iOS Safari НЕ агрессивен)
                     let window_updates = http2_handler.check_and_send_window_updates();
                     for frame in window_updates {
+                        timing.wait_natural_delay().await;
                         server_stream.write_all(&frame).await?;
                     }
 
@@ -472,7 +546,9 @@ impl ProxyHandler {
         
         let mut client_buffer = vec![0u8; BUFFER_SIZE];
         let mut server_buffer = vec![0u8; BUFFER_SIZE];
-        let mut timing = TimingPreserver::new(0.05);
+        
+        // iOS Safari timing
+        let mut timing = TimingPreserver::ios_safari();
 
         loop {
             if self.graceful_shutdown.is_shutting_down().await {
@@ -488,6 +564,7 @@ impl ProxyHandler {
                             break;
                         }
                         Ok(n) => {
+                            // Естественная задержка
                             timing.wait_natural_delay().await;
                             
                             if let Err(e) = server_stream.write_all(&client_buffer[..n]).await {

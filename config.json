@@ -2,58 +2,20 @@
   "profiles": [
     {
       "name": "ios_safari",
-      "cipher_suites": [
-        "TLS_AES_128_GCM_SHA256",
-        "TLS_AES_256_GCM_SHA384",
-        "TLS_CHACHA20_POLY1305_SHA256",
-        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
-      ],
-      "extensions": [
-        "server_name",
-        "status_request",
-        "supported_groups",
-        "ec_point_formats",
-        "signature_algorithms",
-        "application_layer_protocol_negotiation",
-        "signed_certificate_timestamp",
-        "key_share",
-        "psk_key_exchange_modes",
-        "supported_versions",
-        "compress_certificate",
-        "session_ticket"
-      ],
-      "supported_versions": [
-        "TLS 1.3",
-        "TLS 1.2"
-      ],
-      "alpn": [
-        "h2",
-        "http/1.1"
-      ],
-      "signature_algorithms": [
-        "ecdsa_secp256r1_sha256",
-        "rsa_pss_rsae_sha256",
-        "rsa_pkcs1_sha256"
-      ],
-      "key_share_groups": [
-        "x25519",
-        "secp256r1"
-      ],
-      "psk_key_exchange_modes": [
-        "psk_dhe_ke"
-      ],
-      "compress_certificate": [
-        "brotli"
-      ]
+      "cipher_suites": [],
+      "extensions": [],
+      "supported_versions": [],
+      "alpn": ["h2", "http/1.1"],
+      "signature_algorithms": [],
+      "key_share_groups": [],
+      "psk_key_exchange_modes": [],
+      "compress_certificate": []
     }
   ],
   "default_profile": "ios_safari",
   "proxy_settings": {
+    "proxy_type": "direct",
     "proxy_host": "127.0.0.1",
-    "proxy_port": 1080,
-    "proxy_type": "socks5",
-    "username": null,
-    "password": null
+    "proxy_port": 1080
   }
 }
